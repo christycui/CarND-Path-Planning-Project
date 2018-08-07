@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -200,7 +201,13 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  // start in lane 1 (middle lane)
+  int lane = 1;
+
+  // reference velocity
+  double ref_vel = 49.5;
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane, &ref_vel](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -222,6 +229,8 @@ int main() {
         	// Main car's localization Data
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
+            cout << "car_x: " << car_x << endl;
+            cout << "car_y: " << car_y << endl;
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
@@ -237,12 +246,108 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
+            int prev_size = previous_path_x.size();
+            cout << prev_size << endl;
 
+            // create evenly spaced waypoints
+            vector<double> ptsx;
+            vector<double> ptsy;
+
+            // starting ref points
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+            if (prev_size < 2) {
+              double prev_car_x = ref_x - cos(car_yaw);
+              double prev_car_y = ref_y - sin(car_yaw);
+
+              ptsx.push_back(prev_car_x);
+              ptsx.push_back(ref_x);
+              ptsy.push_back(prev_car_y);
+              ptsy.push_back(ref_y);
+            } else {
+              // take the last two points in current waypoints
+              ref_x = previous_path_x[prev_size-1];
+              ref_y = previous_path_y[prev_size-1];
+
+              double second_to_last_x = previous_path_x[prev_size-2];
+              double second_to_last_y = previous_path_y[prev_size-2];
+              ref_yaw = atan2(ref_y-second_to_last_y, ref_x-second_to_last_x);
+
+              ptsx.push_back(second_to_last_x);
+              ptsx.push_back(ref_x);
+              ptsy.push_back(second_to_last_y);
+              ptsy.push_back(ref_y);
+            }
+
+            // add 30m even spaced waypoints (in Frenet!)
+            vector<double> next_wp0 = getXY(car_s+20, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s+40, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s+60, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            ptsx.push_back(next_wp0[0]);
+            ptsy.push_back(next_wp0[1]);
+            ptsx.push_back(next_wp1[0]);
+            ptsy.push_back(next_wp1[1]);
+            ptsx.push_back(next_wp2[0]);
+            ptsy.push_back(next_wp2[1]);
+
+            // shift to local coordinates
+            for (int i = 0; i < ptsx.size(); i++) {
+              double shift_x = ptsx[i] - ref_x;
+              double shift_y = ptsy[i] - ref_y;
+              ptsx[i] = shift_x*cos(-ref_yaw)-shift_y*sin(-ref_yaw);
+              ptsy[i] = shift_x*sin(-ref_yaw)+shift_y*cos(-ref_yaw);
+            }
+
+            // spline calculation
+            tk::spline s;
+            for (int i = 0; i < 5; i++) {
+              cout << "ptsx: " << ptsx[i] << endl;
+              cout << "ptsy: " << ptsy[i]<< endl;
+            }
+            
+            s.set_points(ptsx, ptsy);
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
+            cout << "prev x: " << previous_path_x << endl;
+            cout << "prev y: " << previous_path_y << endl;
+            // save prev points
+            for (int i = 0; i < previous_path_x.size(); i++) {
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
 
+            }
 
+            // fill the rest with spline
+            double target_x = 30.;
+            double target_y = s(target_x);
+            cout << "taerget y: " << target_y <<endl;
+            double target_dist = sqrt(target_x*target_x+target_y*target_y);
+            double x_add_on = 0;
+            
+            for (int i = 0; i < 50-previous_path_x.size(); i++) {
+              double N = target_dist/(.02*ref_vel/2.24);
+              double x_point = target_x/N + x_add_on;
+              double y_point = s(target_x);
+              x_add_on = x_point;
+
+              // back to normal coordinates
+              double x_ref = x_point;
+              double y_ref = y_point;
+              x_point = x_ref*cos(ref_yaw)-y_ref*sin(ref_yaw);
+              y_point = x_ref*sin(ref_yaw)+y_ref*cos(ref_yaw);
+
+              x_point += ref_x;
+              y_point += ref_y;
+
+              next_x_vals.push_back(x_point);
+              next_y_vals.push_back(y_point);
+              cout << "x point: " << x_point << endl;
+              cout << "y point: " << y_point << endl;
+            }
+
+            json msgJson;
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
