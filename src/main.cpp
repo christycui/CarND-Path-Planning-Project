@@ -137,7 +137,8 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
+vector<double> getXY(double s, double d, const vector<double> &maps_s, 
+  const vector<double> &maps_x, const vector<double> &maps_y)
 {
 	int prev_wp = -1;
 
@@ -205,7 +206,7 @@ int main() {
   int lane = 1;
 
   // reference velocity
-  double ref_vel = 49.5;
+  double ref_vel = 49.5; // mph
 
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane, &ref_vel](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
@@ -254,25 +255,33 @@ int main() {
             vector<double> ptsy;
 
             // starting ref points
-            double ref_x = car_x;
-            double ref_y = car_y;
-            double ref_yaw = deg2rad(car_yaw);
+            double ref_x, ref_y, ref_yaw;
+            cout << "prev x: " << previous_path_x << endl;
+            cout << "prev y: " << previous_path_y << endl;
             if (prev_size < 2) {
-              double prev_car_x = ref_x - cos(car_yaw);
-              double prev_car_y = ref_y - sin(car_yaw);
+              // starting out
+              ref_x = car_x;
+              ref_y = car_y; 
+              ref_yaw = deg2rad(car_yaw);
+              double prev_car_x = car_x - cos(ref_yaw);
+              double prev_car_y = car_y - sin(ref_yaw);
 
               ptsx.push_back(prev_car_x);
               ptsx.push_back(ref_x);
               ptsy.push_back(prev_car_y);
               ptsy.push_back(ref_y);
             } else {
-              // take the last two points in current waypoints
+              // take the last two points in prev path
               ref_x = previous_path_x[prev_size-1];
               ref_y = previous_path_y[prev_size-1];
 
               double second_to_last_x = previous_path_x[prev_size-2];
               double second_to_last_y = previous_path_y[prev_size-2];
+              cout << "last point: " << ref_x << " " << ref_y << endl;
+              cout << "second to last point: " << second_to_last_x << " " << second_to_last_y << endl;
               ref_yaw = atan2(ref_y-second_to_last_y, ref_x-second_to_last_x);
+
+              cout << "ref_yaw: " << ref_yaw << endl;
 
               ptsx.push_back(second_to_last_x);
               ptsx.push_back(ref_x);
@@ -281,9 +290,9 @@ int main() {
             }
 
             // add 30m even spaced waypoints (in Frenet!)
-            vector<double> next_wp0 = getXY(car_s+20, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp1 = getXY(car_s+40, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp2 = getXY(car_s+60, (4*lane+2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp0 = getXY(car_s+30, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s+60, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s+90, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
             ptsx.push_back(next_wp0[0]);
             ptsy.push_back(next_wp0[1]);
@@ -302,34 +311,28 @@ int main() {
 
             // spline calculation
             tk::spline s;
-            for (int i = 0; i < 5; i++) {
-              cout << "ptsx: " << ptsx[i] << endl;
-              cout << "ptsy: " << ptsy[i]<< endl;
-            }
             
             s.set_points(ptsx, ptsy);
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
-            cout << "prev x: " << previous_path_x << endl;
-            cout << "prev y: " << previous_path_y << endl;
+            
             // save prev points
-            for (int i = 0; i < previous_path_x.size(); i++) {
+            for (int i = 0; i < prev_size; i++) {
               next_x_vals.push_back(previous_path_x[i]);
               next_y_vals.push_back(previous_path_y[i]);
 
             }
 
             // fill the rest with spline
-            double target_x = 30.;
+            double target_x = 30;
             double target_y = s(target_x);
-            cout << "taerget y: " << target_y <<endl;
             double target_dist = sqrt(target_x*target_x+target_y*target_y);
             double x_add_on = 0;
             
-            for (int i = 0; i < 50-previous_path_x.size(); i++) {
+            for (int i = 0; i < 50-prev_size; i++) {
               double N = target_dist/(.02*ref_vel/2.24);
               double x_point = target_x/N + x_add_on;
-              double y_point = s(target_x);
+              double y_point = s(x_point);
               x_add_on = x_point;
 
               // back to normal coordinates
@@ -337,7 +340,7 @@ int main() {
               double y_ref = y_point;
               x_point = x_ref*cos(ref_yaw)-y_ref*sin(ref_yaw);
               y_point = x_ref*sin(ref_yaw)+y_ref*cos(ref_yaw);
-
+        
               x_point += ref_x;
               y_point += ref_y;
 
