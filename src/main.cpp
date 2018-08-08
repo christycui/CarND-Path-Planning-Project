@@ -165,6 +165,27 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s,
 
 }
 
+double avg_lane_speed(vector<double> v) {
+  // no car in this lane - speed is max
+  if (v.empty()) return 49;
+  return accumulate(v.begin(), v.end(), 0.0)/v.size(); 
+}
+
+double inefficiency_cost(double target_speed, int intended_lane, int final_lane, vector<double> lane_speeds) {
+    /*
+    Cost becomes higher for trajectories with intended lane and final lane that have traffic slower than target_speed.
+    */
+    
+    double intended_lane_speed = lane_speeds[intended_lane];
+    double final_lane_speed = lane_speeds[final_lane];
+    int max_index = distance(lane_speeds.begin(), max_element(lane_speeds.begin(), lane_speeds.end()));
+    double delta_d = abs(final_lane - max_index) + abs(intended_lane - max_index);
+    //TODO: Replace cost = 0 with an appropriate cost function.
+    double cost = 1-exp(-2*target_speed / (float)(lane_speeds[intended_lane] + lane_speeds[final_lane]));
+    
+    return cost;
+}
+
 int main() {
   uWS::Hub h;
 
@@ -206,7 +227,7 @@ int main() {
   int lane = 1;
 
   // reference velocity
-  double ref_vel = 49.5; // mph
+  double ref_vel = 0; // mph
 
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane, &ref_vel](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
@@ -230,8 +251,6 @@ int main() {
         	// Main car's localization Data
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
-            cout << "car_x: " << car_x << endl;
-            cout << "car_y: " << car_y << endl;
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
@@ -248,16 +267,114 @@ int main() {
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
             int prev_size = previous_path_x.size();
-            cout << prev_size << endl;
+            bool too_close = false;
+            bool left_lane_safe = true;
+            bool right_lane_safe = true;
+            double target_speed = 49;
 
+            // use sensor fusion
+            // to determine behavior
+            vector<double> left_lane_speeds, mid_lane_speeds, right_lane_speeds;
+            for (int i = 0; i < sensor_fusion.size(); i++) {
+              // record lane speed for each lane
+              float vx = sensor_fusion[i][3];
+              float vy = sensor_fusion[i][4];
+              float obj_speed = sqrt(vx*vx+vy*vy);
+              float d = sensor_fusion[i][6];
+              float obj_s = sensor_fusion[i][5];
+              float future_s;
+              // only record speeds for cars in front
+              if (obj_s > car_s) {
+                if (d <= 4) left_lane_speeds.push_back(obj_speed);
+                if (d > 4 && d <= 8) mid_lane_speeds.push_back(obj_speed);
+                if (d > 8) right_lane_speeds.push_back(obj_speed);
+              }
+              // if car is in my lane
+              if (d > 4*lane && d < 4*lane+4) {
+                future_s = obj_s + prev_size*.02*obj_speed;
+                // if car in front and future distance too close
+                if (obj_s > car_s && future_s - car_s < 50) {
+                  too_close = true;
+                  cout << "TOO CLOSE!" << endl;
+                }
+              } 
+              // car not in left lane and check left safe
+              if (lane != 0 && d > 4*(lane-1) && d < 4*(lane-1)+4) {
+                if (-5 < obj_s-car_s && obj_s-car_s < 20) left_lane_safe = false;
+              }
+              // car not in right lane and check right safe
+              if (lane != 2 && d > 4*(lane+1) && d < 4*(lane+1)+4) {
+                if (-5 < obj_s-car_s && obj_s-car_s < 20) right_lane_safe = false;
+              }
+            }
+            vector<double> lane_speeds;
+            lane_speeds.push_back(avg_lane_speed(left_lane_speeds));
+            lane_speeds.push_back(avg_lane_speed(mid_lane_speeds));
+            lane_speeds.push_back(avg_lane_speed(right_lane_speeds));
+
+            if (!left_lane_safe || !right_lane_safe ) cout << "LEFT OR RIGHT LANE NOT SAFE" << endl;
+            if (too_close) {
+              // behavior planning
+              vector<double> state_costs; // LK, LCL, LCR, PLCL, PLCR
+              double lk_cost, lcl_cost, lcr_cost, plcl_cost, plcr_cost;
+              // lane keep
+              lk_cost = inefficiency_cost(target_speed, lane, lane, lane_speeds);
+              // left lane exists
+              if (lane-1>=0) {
+                lcl_cost = inefficiency_cost(target_speed, lane-1, lane-1, lane_speeds);
+                plcl_cost = inefficiency_cost(target_speed, lane, lane-1, lane_speeds);
+              } else {
+                lcl_cost = 9999.;
+                plcl_cost = 9999.;
+              }
+              // right lane exists
+              if (lane+1<=2) {
+                lcr_cost = inefficiency_cost(target_speed, lane+1, lane+1, lane_speeds);
+                plcr_cost = inefficiency_cost(target_speed, lane, lane+1, lane_speeds);
+              } else {
+                lcr_cost = 9999.;
+                plcr_cost = 9999.;
+              }
+              state_costs.push_back(lk_cost);
+              state_costs.push_back(lcl_cost);
+              state_costs.push_back(lcr_cost);
+              state_costs.push_back(plcl_cost);
+              state_costs.push_back(plcr_cost);
+
+              float min_value = 9999.;
+              int min_index;
+              for (int i = 0; i < state_costs.size(); i++) {
+                if (state_costs[i] < min_value) {
+                  min_value = state_costs[i];
+                  min_index = i;
+                }
+              }
+
+              // if not safe to change lanes
+              if (min_index == 1 && !left_lane_safe) min_index = 3;
+              if (min_index == 2 && !right_lane_safe) min_index = 4;
+              cout << "DECISION BEHAVIOR: " << min_index << endl;
+              if (min_index == 0) {
+                target_speed = lane_speeds[lane];
+              } else if (min_index == 1) {
+                lane -= 1;
+                target_speed = lane_speeds[lane-1];
+              } else if (min_index == 2) {
+                lane += 1;
+                target_speed = lane_speeds[lane+1];
+              } else if (min_index == 3) {
+                target_speed = lane_speeds[lane-1];
+              } else if (min_index == 4) {
+                target_speed = lane_speeds[lane+1];
+              }
+            }
+            
             // create evenly spaced waypoints
             vector<double> ptsx;
             vector<double> ptsy;
 
             // starting ref points
             double ref_x, ref_y, ref_yaw;
-            cout << "prev x: " << previous_path_x << endl;
-            cout << "prev y: " << previous_path_y << endl;
             if (prev_size < 2) {
               // starting out
               ref_x = car_x;
@@ -277,11 +394,7 @@ int main() {
 
               double second_to_last_x = previous_path_x[prev_size-2];
               double second_to_last_y = previous_path_y[prev_size-2];
-              cout << "last point: " << ref_x << " " << ref_y << endl;
-              cout << "second to last point: " << second_to_last_x << " " << second_to_last_y << endl;
               ref_yaw = atan2(ref_y-second_to_last_y, ref_x-second_to_last_x);
-
-              cout << "ref_yaw: " << ref_yaw << endl;
 
               ptsx.push_back(second_to_last_x);
               ptsx.push_back(ref_x);
@@ -290,9 +403,9 @@ int main() {
             }
 
             // add 30m even spaced waypoints (in Frenet!)
-            vector<double> next_wp0 = getXY(car_s+30, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp1 = getXY(car_s+60, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            vector<double> next_wp2 = getXY(car_s+90, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp0 = getXY(car_s+50, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s+100, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s+120, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
             ptsx.push_back(next_wp0[0]);
             ptsy.push_back(next_wp0[1]);
@@ -324,12 +437,21 @@ int main() {
             }
 
             // fill the rest with spline
-            double target_x = 30;
+            double target_x = 50;
             double target_y = s(target_x);
             double target_dist = sqrt(target_x*target_x+target_y*target_y);
             double x_add_on = 0;
-            
+            double delta;
             for (int i = 0; i < 50-prev_size; i++) {
+              if (target_speed < ref_vel) {
+                delta = (ref_vel-target_speed)/50;
+                if (delta > .224) delta = .224;
+                ref_vel -= delta;
+              } else {
+                delta = (target_speed-ref_vel)/50;
+                if (delta > .224) delta = .224;
+                ref_vel += delta;
+              }
               double N = target_dist/(.02*ref_vel/2.24);
               double x_point = target_x/N + x_add_on;
               double y_point = s(x_point);
@@ -346,8 +468,6 @@ int main() {
 
               next_x_vals.push_back(x_point);
               next_y_vals.push_back(y_point);
-              cout << "x point: " << x_point << endl;
-              cout << "y point: " << y_point << endl;
             }
 
             json msgJson;
